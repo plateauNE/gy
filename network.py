@@ -14,7 +14,9 @@ from torch import nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.models as basemodels
-
+from triplet_text_label import triplet_text_label
+from clip import clip
+import math
 OUT_HEIGHT = 8
 OUT_WIDTH = 14
 
@@ -22,17 +24,199 @@ OUT_WIDTH = 14
 
 
 class RiT(nn.Module):
-    def __init__(self, basename="resnet18", num_tool=6, num_verb=10, num_target=15, num_triplet=100, layer_size=8, num_heads=4, d_model=128, hr_output=False, use_ln=False, m=3):
+    def __init__(self, clip_model, basename="resnet18", num_tool=6, num_verb=10, num_target=15, num_triplet=100, layer_size=8, num_heads=4, d_model=128, hr_output=False, use_ln=False, m=3):
         super(RiT, self).__init__()
         self.encoder = Encoder(basename, num_tool, num_verb,
                                num_target, num_triplet, hr_output=hr_output, m=m)
         self.decoder = Decoder(layer_size, d_model,
                                num_heads, num_triplet, use_ln=use_ln, m=m)
+        self.gy = gy_clip(clip_model)
+        self.fc_joint_a = nn.Linear(200, 100)
 
     def forward(self, inputs):
         enc_i, enc_v, enc_t, enc_ivt = self.encoder(inputs)
-        dec_ivt = self.decoder(enc_i, enc_v, enc_t, enc_ivt)
-        return enc_i, enc_v, enc_t, dec_ivt
+        dec_ivt, cam_ivt = self.decoder(enc_i, enc_v, enc_t, enc_ivt)
+        gy_ivt = self.gy(cam_ivt)
+        out_ivt = self.fc_joint_a(torch.cat((dec_ivt, gy_ivt), dim=1))
+        return enc_i, enc_v, enc_t, out_ivt
+
+
+class gy_clip(nn.Module):  # 只是得到promte的word embedding
+    def __init__(self, clip_model):
+        super().__init__()
+        self.prompt_learner = PromptLearner(clip_model)
+        self.text_encoder = TextEncoder(clip_model)
+        self.fc1 = nn.Linear(112, 512)
+        self.attn = nn.MultiheadAttention(512, 8)
+        # self.logit_scale = clip_model.logit_scale
+        self.amp = nn.AdaptiveMaxPool1d(1)
+        self.gcn1 = GraphConvolution(512, 2048)
+        self.gcn2 = GraphConvolution(2048, 2048)
+        self.gcn3 = GraphConvolution(2048, 512)
+        self.relu = nn.LeakyReLU(0.2)
+        self.mlp = nn.Linear(100, 100)
+
+    def forward(self, x):
+        bt, c, h, w = x.shape
+        prompts = self.prompt_learner()  # 学习到的promte
+        tokenized_prompts = self.prompt_learner.tokenized_prompts
+        text_features = self.text_encoder(prompts, tokenized_prompts)
+        text_features, relation = self.attn(text_features, text_features, text_features)
+        relation = relation.unsqueeze(0).repeat(bt, 1, 1)
+        x = x.view(bt, c, -1)
+        x = self.fc1(x)
+        identity = x
+
+        x = self.gcn1(x, relation)
+        x = self.relu(x)
+        x = self.gcn2(x, relation)
+        x = self.relu(x)
+        x = self.gcn3(x, relation)
+        x += identity
+        x = self.amp(x).squeeze(-1)
+        x = self.mlp(x)
+        return x
+
+
+class PromptLearner(nn.Module):  # 只是得到promte的word embedding
+    def __init__(self, clip_model):
+        super().__init__()
+        triplet_label = triplet_text_label
+        n_cls = len(triplet_label.keys())
+        # n_ctx = cfg.n_ctx
+        # ctx_init = cfg.ctx_init.replace("_", " ")  # a photo of a
+        ctx_init = "a photo of a"
+        n_ctx = 4
+        # 如果n_ctx不等于ctx_init字符数量，则报错
+        assert n_ctx == len(ctx_init.split(" "))
+        dtype = clip_model.dtype
+
+        # 将初始promte：a photo of a 给embedding，变成可学习参数ctx
+        prompt = clip.tokenize(ctx_init)
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(prompt).type(dtype)
+        ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
+        prompt_prefix = ctx_init
+
+        # 将ctx_vectors变为可学习的参数传递给ctx
+        self.ctx = nn.Parameter(ctx_vectors)  # 可学习,初始值仍为a photo of a
+        # self.ctx = ctx_vectors  # 不学习，仍然是a photo of a
+
+        # 生成最终的句子，格式为[prompt_prefix] [三联label].
+        prompts = [prompt_prefix + " " + triplet_label[id] + "." for id in triplet_label.keys()]
+        # token化，然后喂入CLIP 做embedding
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
+        # 使用缓存register_buffer将参数保存，但不参与更新
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        # token_suffix是包含CLS即[class]的，这是不可学习的
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        # 没有用到，其实就是a photo of a只不过参数化后变成ctx了，后续用到的是ctx
+        self.register_buffer("token_middle", embedding[:, 1: (1 + n_ctx), :])
+
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.n_cls = n_cls
+
+    def forward(self):
+        ctx = self.ctx
+        # 当batch_size为1时，仍然将其扩展为3维以上。
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+
+        # ctx是可学习的参数，prefix和suffix是不可学习的参数，是SOS,CLS,SOS即开头和结尾符号
+        prompts = torch.cat(
+            [
+                prefix,  # (n_cls, 1, dim)
+                ctx,  # (n_cls, n_ctx, dim)
+                suffix,  # (n_cls, *, dim)
+            ],  # type: ignore
+            dim=1,
+        )
+        return prompts
+
+
+class TextEncoder(nn.Module):  # 将promte后的word embedding转化为text encoder
+
+    def __init__(self, clip_model):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
+
+    def forward(self, prompts, tokenized_prompts):
+        # x是word embedding
+        x = prompts + self.positional_embedding.type(self.dtype)
+        # 维度顺序改变，便于transformer计算
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        # 计算完再改回来
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        # 归一化
+        x = self.ln_final(x).type(self.dtype)
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # 得到最终的文本特征，也就是text encoder的结果。
+        x = (
+            x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)]
+            @ self.text_projection
+        )
+
+        return x
+
+
+class GraphConvolution(nn.Module):
+    def __init__(self, in_features, out_features, bias=False):
+        super(GraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # 可学习的权重矩阵，维度为in_features乘out_features
+        self.weight = nn.parameter.Parameter(torch.Tensor(in_features, out_features))
+        # 可学习的偏置项
+        if bias:
+            self.bias = nn.parameter.Parameter(torch.Tensor(1, 1, out_features))
+        else:
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    # 初始化权重参数
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+        # 也可以采用凯明初始化
+        # nn.init.kaiming_uniform_(self.weight)
+
+    def forward(self, input, adj):
+        # 先计算HW，即text与W乘
+        support = torch.matmul(input, self.weight)
+        # 再计算A*HW，即临近矩阵乘HW
+        # 顺序有待商榷，GCN正常是先AH，再乘W
+        output = torch.matmul(adj, support)
+        # 加偏置项
+        if self.bias is not None:
+            return output + self.bias
+        else:
+            return output
+
+    # 可以使用print打印模型，输出模型的输入和输出特征维度，方便调试
+    def __repr__(self):
+        return (
+            self.__class__.__name__
+            + " ("
+            + str(self.in_features)
+            + " -> "
+            + str(self.out_features)
+            + ")"
+        )
+
 
 # %% Triplet Components Feature Encoder
 
@@ -76,7 +260,7 @@ class Decoder(nn.Module):
             X = M(X)
             X = F(X)
         logits = self.classifier(X)
-        return logits
+        return logits, X
 
 # %% Feature extraction backbone
 

@@ -28,11 +28,11 @@ from evaluator import evaluate_model
 from network import RiT
 import warnings
 from datetime import datetime
+from clip import clip
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-# 初始版本
 def parse_args():
     """
     Parse input arguments
@@ -125,6 +125,13 @@ def parse_args():
 
     args = parser.parse_args()
     return args
+
+
+def load_clip():
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device="cpu")
+    model.float()
+    return model
 
 
 def train_net(net, loader, optimizers, schedulers, args, epoch, mode="train"):
@@ -227,7 +234,8 @@ if __name__ == "__main__":
     # load net
     hr_out = False
     use_ln = True if args.ln else False
-    net = RiT(layer_size=args.layers, d_model=128, basename="resnet18",
+    clip_model = load_clip()
+    net = RiT(clip_model, layer_size=args.layers, d_model=128, basename="resnet18",
               hr_output=False, use_ln=use_ln, m=args.m)
 
     # count model parameters
@@ -249,9 +257,11 @@ if __name__ == "__main__":
                     params1 += [{'params': [value]}]
             elif 'decoder' in key or 'bottleneck' in key:
                 params3 += [{'params': [value]}]
-            else:
-                print("---- keys missed ------")
-                print(key)
+            elif "gy" in key and "text_encoder" not in key:
+                params3 += [{"params": [value]}]
+            # else: #这里是打印无需训练的参数
+            #     print("---- keys missed ------")
+            #     print(key)
 
     # param length
     print(f"LENGTH >> params1 {len(params1)} | params2 {len(params2)} | params3 {len(params3)}", file=open(
