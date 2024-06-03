@@ -1,0 +1,44 @@
+>>>>>>>>>>>>>>>>>>>>>>  Args Start <<<<<<<<<<<<<<<<<<<<<<<
+
+{'aug_list': ['rot90', 'hflip', 'contrast', 'original'],
+ 'bs': 4,
+ 'cg': 1,
+ 'ckp_folder': 'checkpoints',
+ 'ckp_name': 'rit_rdv_split_weights.pth',
+ 'data_dir': '/home/imris/project/dataset/CholecT50',
+ 'disp_interval': 100,
+ 'early_stopping_patience': 5,
+ 'evaluate': 0,
+ 'exp_name': 'rdv',
+ 'fold': 1,
+ 'g1': 0.94,
+ 'g2': 0.95,
+ 'g3': 0.99,
+ 'gpus': 0,
+ 'layers': 8,
+ 'ln': 1,
+ 'log_name': 'rdv.log',
+ 'logfile': 'checkpoints/rdv/rdv.log',
+ 'm': 3,
+ 'max_epochs': 100,
+ 'mom': 0.95,
+ 'ms1': 20,
+ 'ms2': 40,
+ 'ms3': 60,
+ 'nw': 2,
+ 'od1': 1e-06,
+ 'od2': 1e-06,
+ 'od3': 1e-06,
+ 'output_dir': './output',
+ 'resume': 0,
+ 'save_dir': 'checkpoints',
+ 'save_folder': 'test',
+ 'seed': 324,
+ 'split': 'cholect50-challenge',
+ 'start_epoch': 1,
+ 'topK': 5}
+LENGTH >> params1 6 | params2 128 | params3 426
+
+>>>>>>>>>>>>>>>>>>>>>>  Args End <<<<<<<<<<<<<<<<<<<<<<<
+
+Augmentations used  ----> ['rot90', 'hflip', 'contrast', 'original'] 
