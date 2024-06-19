@@ -19,7 +19,6 @@ from clip import clip
 import math
 OUT_HEIGHT = 8
 OUT_WIDTH = 14
-
 # %% Rendezvous-in-time (RiT)
 
 
@@ -30,39 +29,72 @@ class RiT(nn.Module):
                                num_target, num_triplet, hr_output=hr_output, m=m)
         self.decoder = Decoder(layer_size, d_model,
                                num_heads, num_triplet, use_ln=use_ln, m=m)
-        self.gy = gy_clip(clip_model)
+        self.gy = gy_clip(clip_model, m=m)
         self.fc_joint_a = nn.Linear(200, 100)
 
     def forward(self, inputs):
-        enc_i, enc_v, enc_t, enc_ivt = self.encoder(inputs)
+        enc_i, enc_v, enc_t, enc_ivt, high_x = self.encoder(inputs)
         dec_ivt, cam_ivt = self.decoder(enc_i, enc_v, enc_t, enc_ivt)
-        gy_ivt = self.gy(cam_ivt)
+        gy_ivt = self.gy(cam_ivt, high_x)
         out_ivt = self.fc_joint_a(torch.cat((dec_ivt, gy_ivt), dim=1))
         return enc_i, enc_v, enc_t, out_ivt
 
 
 class gy_clip(nn.Module):  # 只是得到promte的word embedding
-    def __init__(self, clip_model):
+    def __init__(self, clip_model, m):
         super().__init__()
         self.prompt_learner = PromptLearner(clip_model)
         self.text_encoder = TextEncoder(clip_model)
-        self.fc1 = nn.Linear(112, 512)
-        self.attn = nn.MultiheadAttention(512, 8)
-        # self.logit_scale = clip_model.logit_scale
-        self.amp = nn.AdaptiveMaxPool1d(1)
-        self.gcn1 = GraphConvolution(512, 2048)
+        self.dim = 512
+        self.fc1 = nn.Linear(112, self.dim)
+        self.attn = nn.MultiheadAttention(self.dim, 8)
+        self.attn1 = nn.MultiheadAttention(self.dim, 8)
+        # 创建一个transformer encoder结构，去生成step。先建EncoderLayer再建Encoder
+        self.pos_embed = nn.Parameter(torch.zeros(1, 112, 512))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)  # 初始化位置编码
+        enc_layer = nn.TransformerEncoderLayer(self.dim, nhead=8)
+        self.transformer_enc = nn.TransformerEncoder(
+            enc_layer, num_layers=4, norm=nn.LayerNorm(self.dim))
+        self.fc2 = nn.Linear(512 * 112, 100 * 100)
+        self.soft = nn.Softmax(dim=1)
+        self.conv1 = nn.Conv2d(in_channels=m+1, out_channels=1, kernel_size=1)
+
+        self.amp = nn.AdaptiveAvgPool1d(1)
+        self.gcn1 = GraphConvolution(self.dim, 2048)
         self.gcn2 = GraphConvolution(2048, 2048)
-        self.gcn3 = GraphConvolution(2048, 512)
+        self.gcn3 = GraphConvolution(2048, self.dim)
         self.relu = nn.LeakyReLU(0.2)
         self.mlp = nn.Linear(100, 100)
+        self.m = m
 
-    def forward(self, x):
+    def forward(self, x, high_x):
         bt, c, h, w = x.shape
+        b = int(bt/(self.m + 1))
         prompts = self.prompt_learner()  # 学习到的promte
         tokenized_prompts = self.prompt_learner.tokenized_prompts
         text_features = self.text_encoder(prompts, tokenized_prompts)
         text_features, relation = self.attn(text_features, text_features, text_features)
-        relation = relation.unsqueeze(0).repeat(bt, 1, 1)
+        # relation = relation.unsqueeze(0).repeat(bt, 1, 1)  # [b,100,100]
+
+        # 处理图像特征得到手术阶段
+        bh, ch, hh, wh = high_x.shape
+        high_x = high_x.permute(2, 3, 0, 1).view(-1, bh, ch)
+        high_x = self.transformer_enc(high_x)
+        high_x = high_x.permute(1, 2, 0).view(-1, self.m+1, ch, hh*wh)
+        high_x = self.conv1(high_x).squeeze(1)  # 用1x1conv沿时间维度合并
+        high_x = high_x.view(b, -1)
+        high_x = self.fc2(high_x)
+        high_x = high_x.view(b, 100, 100)
+
+        # 根据high_x得到动态relation
+        relation = relation.unsqueeze(0).repeat(b, 1, 1)  # [b,100,100]
+        attention = torch.matmul(high_x, relation.transpose(-2, -1)) / \
+            torch.sqrt(torch.tensor(100, dtype=torch.float32))
+        attention = self.soft(attention)
+        relation = torch.matmul(attention, relation)
+        relation = relation.unsqueeze(1).repeat(1, self.m + 1, 1, 1)
+        relation = relation.view(-1, 100, 100)
+
         x = x.view(bt, c, -1)
         x = self.fc1(x)
         identity = x
@@ -237,7 +269,7 @@ class Encoder(nn.Module):
         enc_i = self.wsl(high_x)
         enc_v, enc_t = self.cagam(high_x, enc_i[0])
         enc_ivt = self.bottleneck(low_x)
-        return enc_i, enc_v, enc_t, enc_ivt
+        return enc_i, enc_v, enc_t, enc_ivt, high_x
 
 # %% MultiHead Attention Decoder
 

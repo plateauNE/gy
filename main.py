@@ -53,7 +53,7 @@ def parse_args():
                         help='number of worker to load data')
     parser.add_argument('--gpus', dest='gpus', nargs='+', type=int,
                         default=0, help='gpu ids.')
-    parser.add_argument('--bs', default=4, type=int,
+    parser.add_argument('--bs', default=8, type=int,
                         help='batch_size')
     parser.add_argument('--seed', dest='seed', default=324, type=int,
                         help='seed value')
@@ -75,11 +75,11 @@ def parse_args():
                         help='num epochs to wait if val metric does not improve')
 
     # resume trained model
-    parser.add_argument('--resume', default=0, type=int,
+    parser.add_argument('--resume', default=1, type=int,
                         help='resume checkpoint or not')
     parser.add_argument('--evaluate', default=0, type=int,
                         help='evaluate with the provided checkpoint')
-    parser.add_argument('--ckp_name', default="rit_rdv_split_weights.pth",
+    parser.add_argument('--ckp_name', default="res18_ap389_0531.pth",
                         type=str, help='checkpoint name to load model')
     parser.add_argument('--ckp_folder', default='checkpoints', type=str,
                         help='folder to load checkpoints from')
